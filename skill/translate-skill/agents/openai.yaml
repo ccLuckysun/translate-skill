@@ -1,0 +1,4 @@
+interface:
+  display_name: "论文保版翻译"
+  short_description: "Translate academic PDFs while preserving paper layout."
+  default_prompt: "Use $translate-skill to translate this paper PDF while preserving academic layout, formulas, figures, citations, and references."
