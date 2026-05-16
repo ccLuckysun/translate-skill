@@ -17,6 +17,25 @@ sys.modules[spec.name] = translate_paper
 spec.loader.exec_module(translate_paper)
 
 
+def translations_payload(
+    segments: list[translate_paper.Segment],
+    translations: list[str],
+    job_id: str = "job",
+) -> dict[str, object]:
+    return {
+        "schema_version": translate_paper.SCHEMA_VERSION,
+        "job_id": job_id,
+        "segments": [
+            {
+                "id": segment.id,
+                "source": segment.source,
+                "translation": translation,
+            }
+            for segment, translation in zip(segments, translations)
+        ],
+    }
+
+
 class TranslationMapTests(unittest.TestCase):
     def test_rejects_missing_protected_token(self) -> None:
         segment = translate_paper.make_segment(0, "See Eq. 1 and {v0}.")
@@ -133,6 +152,60 @@ class TranslationMapTests(unittest.TestCase):
             ):
                 translate_paper.load_translation_map(path, [segment], "job")
 
+    def test_rejects_zh_translation_with_only_question_marks(self) -> None:
+        segment = translate_paper.make_segment(0, "Abstract")
+        translations = translations_payload(
+            [segment], ["????????????????????????????????"]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "translations.json"
+            translate_paper.write_json(path, translations)
+            _translations, errors, _warnings, metrics = (
+                translate_paper.validate_translations(path, [segment], "job", "zh")
+            )
+
+            self.assertTrue(any("question-mark" in error for error in errors))
+            self.assertEqual(metrics["total_question_marks"], 32)
+            self.assertEqual(
+                metrics["suspicious_question_mark_segments"], [segment.id]
+            )
+
+    def test_rejects_zh_body_translation_without_cjk(self) -> None:
+        segment = translate_paper.make_segment(0, "Abstract")
+        translations = translations_payload([segment], ["Academic translated text."])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "translations.json"
+            translate_paper.write_json(path, translations)
+            _translations, errors, _warnings, metrics = (
+                translate_paper.validate_translations(path, [segment], "job", "zh")
+            )
+
+            self.assertTrue(any("CJK characters" in error for error in errors))
+            self.assertEqual(metrics["body_segments_with_cjk"], 0)
+            self.assertEqual(metrics["body_segments_without_cjk"], [segment.id])
+
+    def test_allows_english_reference_entry_without_cjk_for_zh(self) -> None:
+        source = "[1] Smith, J. A paper. 2020."
+        segment = translate_paper.Segment(
+            id="seg-00000",
+            index=0,
+            source=source,
+            source_hash=translate_paper.sha256_text(source),
+            protected_tokens=[],
+            segment_type=translate_paper.SEGMENT_REFERENCE_ENTRY,
+        )
+        translations = translations_payload([segment], [source])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "translations.json"
+            translate_paper.write_json(path, translations)
+            _translations, errors, _warnings, metrics = (
+                translate_paper.validate_translations(path, [segment], "job", "zh")
+            )
+
+            self.assertEqual(errors, [])
+            self.assertTrue(metrics["checked_for_cjk"])
+            self.assertEqual(metrics["body_segment_count"], 0)
+
     def test_validate_command_writes_report_and_preview(self) -> None:
         segment = translate_paper.make_segment(0, "See Eq. 6.")
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,6 +216,7 @@ class TranslationMapTests(unittest.TestCase):
                     "schema_version": translate_paper.SCHEMA_VERSION,
                     "job_id": "job",
                     "input_pdf": str(workdir / "paper.pdf"),
+                    "target_language": "zh",
                 },
             )
             translate_paper.write_json(
@@ -162,7 +236,7 @@ class TranslationMapTests(unittest.TestCase):
                         {
                             "id": segment.id,
                             "source": segment.source,
-                            "translation": "See Eq. 6.",
+                            "translation": "参见 Eq. 6。",
                         }
                     ],
                 },
@@ -172,6 +246,10 @@ class TranslationMapTests(unittest.TestCase):
             self.assertEqual(translate_paper.command_validate(args), 0)
             report = translate_paper.read_json(workdir / "validate-report.json")
             self.assertTrue(report["ok"])
+            self.assertEqual(
+                report["translation_quality"]["body_segments_with_cjk"], 1
+            )
+            self.assertEqual(report["translation_quality"]["total_question_marks"], 0)
             self.assertTrue((workdir / "translation-preview.md").exists())
 
 

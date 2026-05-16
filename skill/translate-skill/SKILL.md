@@ -45,6 +45,13 @@ Install the PDF engine when missing:
 python -m pip install "pdf2zh>=1.9,<1.10" pypdf
 ```
 
+If dependency resolution hangs on Windows or a constrained environment, pin the
+known compatible release:
+
+```bash
+python -m pip install --no-input --progress-bar off "pdf2zh==1.9.11" pypdf
+```
+
 ## Translation Behavior
 
 Default translation mode:
@@ -115,10 +122,12 @@ If the user asks for a specific export format, follow it. Otherwise, prefer the 
 
 ## Quality Checks
 
-- Treat `validate` as mandatory after writing `translations.json` and before `render`.
-- Use `segments-preview.md` and `translation-preview.md` for human review; they are UTF-8 markdown files intended to avoid terminal encoding confusion.
+- Treat `validate` as mandatory after writing `translations.json` and before `render`; it checks schema, protected tokens, reference rules, and obvious translation content damage.
+- For Chinese targets, `validate` blocks translations that contain no CJK text in non-reference segments or abnormal `?` counts, which often indicate encoding loss before `translations.json` was written.
+- Use `segments-preview.md` and `translation-preview.md` for human review before trusting rendered PDFs; they are UTF-8 markdown files intended to avoid terminal encoding confusion.
+- On Windows PowerShell, do not pipe large Chinese here-strings into Python. Write translations through UTF-8 files instead, so Chinese text is not replaced with `?` before JSON serialization.
 - Do not judge extracted text quality only from PowerShell `Get-Content`; Unicode ligatures such as `ﬁ` and `ﬂ` may display incorrectly even when the JSON is valid.
-- A `KeyError: 'post'` font subsetting message can appear for some PDFs. If the command exits successfully and `validate`/`verify` pass, treat it as a non-blocking warning and still inspect the rendered PDFs.
+- A `KeyError: 'post'` font subsetting message can appear for some PDFs. If the command exits successfully and `validate`/`verify` pass, treat it as a non-blocking warning and still inspect the rendered mono/dual PDFs.
 
 ## Resources
 

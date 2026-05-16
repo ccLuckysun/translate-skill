@@ -31,12 +31,16 @@ SEGMENT_BODY = "body"
 SEGMENT_REFERENCE_HEADING = "reference_heading"
 SEGMENT_REFERENCE_ENTRY = "reference_entry"
 SEGMENT_TYPES = {SEGMENT_BODY, SEGMENT_REFERENCE_HEADING, SEGMENT_REFERENCE_ENTRY}
+QUESTION_MARK_TOTAL_LIMIT = 100
+QUESTION_MARK_SEGMENT_LIMIT = 20
+QUESTION_MARK_SEGMENT_RATIO = 0.3
 
 _TOKEN_RE = re.compile(
     r"(\{v\d+\}|<b\d+>|</b\d+>|\{\{v\d+\}\}|\[[0-9,\-\s]+\]|"
     r"\([A-Za-z][A-Za-z0-9_.-]*,\s*\d{4}[a-z]?\)|"
     r"\b(?:Fig|Figure|Table|Eq|Equation|Sec|Section)\.?\s*\d+(?:\.\d+)*)"
 )
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
 class SkillError(RuntimeError):
@@ -118,7 +122,9 @@ def ensure_pdf2zh_available() -> types.ModuleType:
     except ImportError as exc:
         raise SkillError(
             "pdf2zh/PDFMathTranslate is required for prepare/render. "
-            "Install it with: python -m pip install 'pdf2zh>=1.9,<1.10'"
+            "Install it with: python -m pip install 'pdf2zh>=1.9,<1.10' "
+            "or pin python -m pip install 'pdf2zh==1.9.11' if dependency "
+            "resolution hangs."
         ) from exc
 
     version = getattr(pdf2zh, "__version__", "")
@@ -126,7 +132,9 @@ def ensure_pdf2zh_available() -> types.ModuleType:
         raise SkillError(
             f"Unsupported pdf2zh version {version!r}. "
             "This skill targets pdf2zh 1.9.x; install with: "
-            "python -m pip install 'pdf2zh>=1.9,<1.10'"
+            "python -m pip install 'pdf2zh>=1.9,<1.10' "
+            "or pin python -m pip install 'pdf2zh==1.9.11' if dependency "
+            "resolution hangs."
         )
     return pdf2zh
 
@@ -237,12 +245,108 @@ def load_segments(path: Path) -> list[Segment]:
     return segments
 
 
+def empty_quality_metrics(target_language: str | None = None) -> dict[str, Any]:
+    return {
+        "target_language": target_language or "",
+        "checked_for_cjk": False,
+        "body_segment_count": 0,
+        "body_segments_with_cjk": 0,
+        "body_segments_without_cjk": [],
+        "total_question_marks": 0,
+        "segments_with_question_marks": 0,
+        "suspicious_question_mark_segments": [],
+    }
+
+
+def is_zh_target(target_language: str | None) -> bool:
+    if not target_language:
+        return False
+    normalized = target_language.strip().replace("_", "-").casefold()
+    return normalized == "zh" or normalized.startswith("zh-")
+
+
+def translation_quality_metrics(
+    translations: dict[str, str],
+    segments: list[Segment],
+    target_language: str | None,
+) -> dict[str, Any]:
+    metrics = empty_quality_metrics(target_language)
+    metrics["checked_for_cjk"] = is_zh_target(target_language)
+
+    suspicious_question_mark_segments: list[str] = []
+    body_segments_without_cjk: list[str] = []
+    body_segment_count = 0
+    body_segments_with_cjk = 0
+    total_question_marks = 0
+    segments_with_question_marks = 0
+
+    for segment in segments:
+        translation = translations.get(segment.id)
+        if translation is None:
+            continue
+
+        question_marks = translation.count("?")
+        total_question_marks += question_marks
+        if question_marks:
+            segments_with_question_marks += 1
+        if question_marks >= QUESTION_MARK_SEGMENT_LIMIT or (
+            question_marks >= 5
+            and question_marks / max(len(translation), 1) >= QUESTION_MARK_SEGMENT_RATIO
+        ):
+            suspicious_question_mark_segments.append(segment.id)
+
+        if segment.segment_type == SEGMENT_REFERENCE_ENTRY:
+            continue
+        body_segment_count += 1
+        if _CJK_RE.search(translation):
+            body_segments_with_cjk += 1
+        else:
+            body_segments_without_cjk.append(segment.id)
+
+    metrics["body_segment_count"] = body_segment_count
+    metrics["body_segments_with_cjk"] = body_segments_with_cjk
+    metrics["body_segments_without_cjk"] = body_segments_without_cjk
+    metrics["total_question_marks"] = total_question_marks
+    metrics["segments_with_question_marks"] = segments_with_question_marks
+    metrics["suspicious_question_mark_segments"] = suspicious_question_mark_segments
+    return metrics
+
+
+def validate_translation_quality(metrics: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    suspicious_ids = metrics["suspicious_question_mark_segments"]
+    if metrics["total_question_marks"] > QUESTION_MARK_TOTAL_LIMIT:
+        errors.append(
+            "translations contain too many question marks "
+            f"({metrics['total_question_marks']}); this usually indicates encoding loss"
+        )
+    if suspicious_ids:
+        errors.append(
+            "translations contain suspicious question-mark damage in: "
+            + ", ".join(suspicious_ids[:20])
+        )
+
+    if (
+        metrics["checked_for_cjk"]
+        and metrics["body_segment_count"] > 0
+        and metrics["body_segments_with_cjk"] == 0
+    ):
+        errors.append(
+            "target language is zh but no non-reference translation segment contains CJK characters"
+        )
+    return errors
+
+
 def validate_translations(
-    path: Path, segments: list[Segment], job_id: str
-) -> tuple[dict[str, str], list[str], list[str]]:
+    path: Path,
+    segments: list[Segment],
+    job_id: str,
+    target_language: str | None = None,
+) -> tuple[dict[str, str], list[str], list[str], dict[str, Any]]:
     data = read_json(path)
     errors: list[str] = []
     warnings: list[str] = []
+    quality_metrics = empty_quality_metrics(target_language)
     if data.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"unsupported translations schema in {path}")
     if data.get("job_id") != job_id:
@@ -252,7 +356,7 @@ def validate_translations(
     raw_segments = data.get("segments")
     if not isinstance(raw_segments, list):
         errors.append("translations.json must contain a segments array")
-        return {}, errors, warnings
+        return {}, errors, warnings, quality_metrics
     if len(raw_segments) != len(segments):
         errors.append(
             f"segment count mismatch: expected {len(segments)}, got {len(raw_segments)}"
@@ -305,11 +409,18 @@ def validate_translations(
     missing_ids = [segment.id for segment in segments if segment.id not in translations]
     if missing_ids:
         errors.append(f"missing translations for: {', '.join(missing_ids[:20])}")
-    return translations, errors, warnings
+    quality_metrics = translation_quality_metrics(
+        translations, segments, target_language
+    )
+    if not missing_ids:
+        errors.extend(validate_translation_quality(quality_metrics))
+    return translations, errors, warnings, quality_metrics
 
 
 def load_translation_map(path: Path, segments: list[Segment], job_id: str) -> dict[str, str]:
-    translations, errors, _warnings = validate_translations(path, segments, job_id)
+    translations, errors, _warnings, _quality_metrics = validate_translations(
+        path, segments, job_id
+    )
     if errors:
         raise SkillError("Invalid translations.json:\n- " + "\n- ".join(errors))
     return translations
@@ -731,6 +842,7 @@ def validation_report_data(
     translations_path: Path,
     errors: list[str],
     warnings: list[str],
+    quality_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     type_counts = {segment_type: 0 for segment_type in sorted(SEGMENT_TYPES)}
     for segment in segments:
@@ -742,6 +854,8 @@ def validation_report_data(
         "translations_path": str(translations_path.resolve()),
         "segment_count": len(segments),
         "segment_type_counts": type_counts,
+        "translation_quality": quality_metrics
+        or empty_quality_metrics(str(job.get("target_language", ""))),
         "errors": errors,
         "warnings": warnings,
     }
@@ -754,10 +868,18 @@ def write_validation_report(
     translations_path: Path,
     errors: list[str],
     warnings: list[str],
+    quality_metrics: dict[str, Any] | None = None,
 ) -> None:
     write_json(
         workdir / "validate-report.json",
-        validation_report_data(job, segments, translations_path, errors, warnings),
+        validation_report_data(
+            job,
+            segments,
+            translations_path,
+            errors,
+            warnings,
+            quality_metrics,
+        ),
     )
 
 
@@ -770,10 +892,21 @@ def command_validate(args: argparse.Namespace) -> int:
         if args.translations
         else workdir / "translations.json"
     )
-    translations, errors, warnings = validate_translations(
-        translations_path, segments, str(job.get("job_id"))
+    translations, errors, warnings, quality_metrics = validate_translations(
+        translations_path,
+        segments,
+        str(job.get("job_id")),
+        str(job.get("target_language", DEFAULT_TARGET_LANGUAGE)),
     )
-    write_validation_report(workdir, job, segments, translations_path, errors, warnings)
+    write_validation_report(
+        workdir,
+        job,
+        segments,
+        translations_path,
+        errors,
+        warnings,
+        quality_metrics,
+    )
     if translations:
         write_text_file(
             workdir / "translation-preview.md",
@@ -801,8 +934,16 @@ def command_render(args: argparse.Namespace) -> int:
         if args.translations
         else workdir / "translations.json"
     )
-    translations, validation_errors, validation_warnings = validate_translations(
-        translations_path, segments, str(job.get("job_id"))
+    (
+        translations,
+        validation_errors,
+        validation_warnings,
+        quality_metrics,
+    ) = validate_translations(
+        translations_path,
+        segments,
+        str(job.get("job_id")),
+        str(job.get("target_language", DEFAULT_TARGET_LANGUAGE)),
     )
     if validation_errors:
         write_validation_report(
@@ -812,6 +953,7 @@ def command_render(args: argparse.Namespace) -> int:
             translations_path,
             validation_errors,
             validation_warnings,
+            quality_metrics,
         )
         raise SkillError("Invalid translations.json:\n- " + "\n- ".join(validation_errors))
 
@@ -873,8 +1015,16 @@ def command_verify(args: argparse.Namespace) -> int:
     translations_valid = translations_path.exists()
     warnings: list[str] = []
     if translations_valid:
-        _translations, validation_errors, validation_warnings = validate_translations(
-            translations_path, segments, str(job.get("job_id"))
+        (
+            _translations,
+            validation_errors,
+            validation_warnings,
+            _quality_metrics,
+        ) = validate_translations(
+            translations_path,
+            segments,
+            str(job.get("job_id")),
+            str(job.get("target_language", DEFAULT_TARGET_LANGUAGE)),
         )
         warnings.extend(validation_warnings)
         if validation_errors:
