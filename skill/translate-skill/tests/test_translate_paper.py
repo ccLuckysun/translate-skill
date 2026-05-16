@@ -104,5 +104,15 @@ class ReplayTranslatorTests(unittest.TestCase):
             translator.translate("Different source.")
 
 
+class AgentPromptTests(unittest.TestCase):
+    def test_prompt_preserves_references_and_author_names(self) -> None:
+        prompt = translate_paper.make_agent_prompt("job", "en", "zh", 3)
+
+        self.assertIn("Keep English bibliography/reference entries unchanged", prompt)
+        self.assertIn("copy its `source` text directly into `translation`", prompt)
+        self.assertIn("Keep English author names", prompt)
+        self.assertIn("Do not transliterate", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

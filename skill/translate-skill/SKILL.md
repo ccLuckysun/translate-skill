@@ -65,6 +65,14 @@ Prompting rules for translated spans:
 - Preserve placeholders, formula markers, and citation markers exactly.
 - Do not rewrite formulas into prose.
 - Do not renumber citations, figures, tables, or references.
+- Keep English bibliography/reference entries unchanged. For reference-list
+  entries, copy the source text as the translation unless the user explicitly
+  asks to translate references.
+- Keep English author names, initials, and Latin-script personal names
+  unchanged in body text and references. Do not transliterate, localize, or
+  translate them into the target language.
+- Keep DOI, URL, journal names, conference names, publisher names, page ranges,
+  volume/issue identifiers, and publication metadata unchanged.
 - Prefer faithful academic translation over aggressive paraphrase.
 
 ## Layout Preservation Rules

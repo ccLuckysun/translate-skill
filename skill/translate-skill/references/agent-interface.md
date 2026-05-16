@@ -39,4 +39,8 @@ rebuild the mono and dual PDFs.
 - Keep segment ids unchanged.
 - Copy each `source` exactly.
 - Preserve every `protected_tokens` value exactly.
+- Copy English bibliography/reference-list entries into `translation`
+  unchanged unless the user explicitly requests translated references.
+- Keep English author names, initials, and Latin-script personal names
+  unchanged; do not transliterate, localize, or translate them.
 - Do not merge, split, reorder, omit, or duplicate segments.

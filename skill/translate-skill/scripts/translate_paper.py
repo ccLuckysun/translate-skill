@@ -405,6 +405,9 @@ Rules:
 - Output JSON only. Do not include markdown fences or commentary.
 - Preserve every `protected_tokens` value exactly in the corresponding translation.
 - Preserve formula placeholders such as `{{{{v0}}}}`, `{{v0}}`, `<b0>`, `</b0>`, and citation/figure/table numbering.
+- Keep English bibliography/reference entries unchanged. If a segment is a bibliography or reference-list entry, copy its `source` text directly into `translation`.
+- Keep English author names, initials, and Latin-script personal names unchanged. Do not transliterate, localize, or translate author names.
+- Keep DOI, URL, journal names, conference names, publisher names, page ranges, volume/issue identifiers, and publication metadata unchanged.
 - Keep the same segment ids and copy each `source` field exactly.
 - Do not merge, split, reorder, omit, or duplicate segments.
 

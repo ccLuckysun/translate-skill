@@ -34,6 +34,12 @@ Treat these as layout-sensitive:
 - Preserve all `protected_tokens` from `segments.json` exactly in `translations.json`.
 - Preserve numeric anchors and identifiers.
 - Preserve bibliography numbering and entry boundaries.
+- Keep English bibliography/reference entries unchanged unless the user
+  explicitly requests translated references.
+- Keep English author names, initials, and Latin-script personal names
+  unchanged. Do not transliterate or translate them.
+- Keep DOI, URL, journal names, conference names, publisher names, page ranges,
+  volume/issue identifiers, and publication metadata unchanged.
 - Do not leak internal placeholders into final output.
 
 ## Failure Checks
