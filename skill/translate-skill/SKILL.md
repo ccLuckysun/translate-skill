@@ -33,10 +33,11 @@ The local script does not directly call the current Codex model; the agent is
 the translation interface between `prepare` and `render`.
 
 1. Run `scripts/translate_paper.py prepare <paper.pdf> --out <workdir> --source en --target zh`.
-2. Read `<workdir>/agent_prompt.md` and `<workdir>/segments.json`.
+2. Read `<workdir>/agent_prompt.md`, `<workdir>/segments.json`, and `<workdir>/segments-preview.md`.
 3. Use the current agent model to write `<workdir>/translations.json` exactly in the requested schema.
-4. Run `scripts/translate_paper.py render <workdir>` to replay translations through pdf2zh and generate mono/dual PDFs.
-5. Run `scripts/translate_paper.py verify <workdir>` before delivery.
+4. Run `scripts/translate_paper.py validate <workdir>` and fix every blocking error before rendering.
+5. Run `scripts/translate_paper.py render <workdir>` to replay translations through pdf2zh and generate mono/dual PDFs.
+6. Run `scripts/translate_paper.py verify <workdir>` before delivery, then inspect the mono/dual PDFs.
 
 Install the PDF engine when missing:
 
@@ -63,6 +64,7 @@ Compatibility mode:
 Prompting rules for translated spans:
 
 - Preserve placeholders, formula markers, and citation markers exactly.
+- Keep every `protected_tokens` value exactly as written. Do not translate labels such as `Eq. 6`, `Figure 1`, or `Table 2` into localized forms.
 - Do not rewrite formulas into prose.
 - Do not renumber citations, figures, tables, or references.
 - Keep English bibliography/reference entries unchanged. For reference-list
@@ -111,6 +113,13 @@ By default, the output should:
 
 If the user asks for a specific export format, follow it. Otherwise, prefer the format produced by the existing layout-preserving PDF translation pipeline.
 
+## Quality Checks
+
+- Treat `validate` as mandatory after writing `translations.json` and before `render`.
+- Use `segments-preview.md` and `translation-preview.md` for human review; they are UTF-8 markdown files intended to avoid terminal encoding confusion.
+- Do not judge extracted text quality only from PowerShell `Get-Content`; Unicode ligatures such as `ﬁ` and `ﬂ` may display incorrectly even when the JSON is valid.
+- A `KeyError: 'post'` font subsetting message can appear for some PDFs. If the command exits successfully and `validate`/`verify` pass, treat it as a non-blocking warning and still inspect the rendered PDFs.
+
 ## Resources
 
 Use bundled resources progressively:
@@ -119,4 +128,4 @@ Use bundled resources progressively:
 - Read `references/agent-interface.md` before creating or validating `translations.json`.
 - Read `references/layout-rules.md` when layout preservation details matter.
 - Read `references/fallback-services.md` only when the user explicitly requests an external translation service.
-- Use `scripts/translate_paper.py` as the local wrapper entrypoint for prepare/render/verify work.
+- Use `scripts/translate_paper.py` as the local wrapper entrypoint for prepare/validate/render/verify work.

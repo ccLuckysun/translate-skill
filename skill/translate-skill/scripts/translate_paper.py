@@ -10,6 +10,7 @@ turning segments.json into translations.json between prepare and render.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib
 import json
@@ -18,6 +19,7 @@ import sys
 import types
 import uuid
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,10 @@ SCHEMA_VERSION = "translate-skill.agent.v1"
 DEFAULT_SOURCE_LANGUAGE = "en"
 DEFAULT_TARGET_LANGUAGE = "zh"
 PDF2ZH_VERSION_PREFIX = "1.9."
+SEGMENT_BODY = "body"
+SEGMENT_REFERENCE_HEADING = "reference_heading"
+SEGMENT_REFERENCE_ENTRY = "reference_entry"
+SEGMENT_TYPES = {SEGMENT_BODY, SEGMENT_REFERENCE_HEADING, SEGMENT_REFERENCE_ENTRY}
 
 _TOKEN_RE = re.compile(
     r"(\{v\d+\}|<b\d+>|</b\d+>|\{\{v\d+\}\}|\[[0-9,\-\s]+\]|"
@@ -44,6 +50,7 @@ class Segment:
     source: str
     source_hash: str
     protected_tokens: list[str]
+    segment_type: str = SEGMENT_BODY
 
 
 def sha256_text(text: str) -> str:
@@ -143,6 +150,36 @@ def make_segment(index: int, text: str) -> Segment:
     )
 
 
+def is_reference_heading(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip()).casefold()
+    normalized = normalized.rstrip(":")
+    return normalized in {"references", "bibliography"}
+
+
+def mark_segment_types(segments: list[Segment]) -> list[Segment]:
+    in_references = False
+    marked: list[Segment] = []
+    for segment in segments:
+        if is_reference_heading(segment.source):
+            in_references = True
+            segment_type = SEGMENT_REFERENCE_HEADING
+        elif in_references:
+            segment_type = SEGMENT_REFERENCE_ENTRY
+        else:
+            segment_type = SEGMENT_BODY
+        marked.append(
+            Segment(
+                id=segment.id,
+                index=segment.index,
+                source=segment.source,
+                source_hash=segment.source_hash,
+                protected_tokens=segment.protected_tokens,
+                segment_type=segment_type,
+            )
+        )
+    return marked
+
+
 def segment_to_json(segment: Segment) -> dict[str, Any]:
     return {
         "id": segment.id,
@@ -150,6 +187,7 @@ def segment_to_json(segment: Segment) -> dict[str, Any]:
         "source": segment.source,
         "source_hash": segment.source_hash,
         "protected_tokens": segment.protected_tokens,
+        "segment_type": segment.segment_type,
     }
 
 
@@ -170,6 +208,7 @@ def load_segments(path: Path) -> list[Segment]:
         source = raw.get("source")
         source_hash = raw.get("source_hash")
         protected_tokens = raw.get("protected_tokens", [])
+        segment_type = raw.get("segment_type", SEGMENT_BODY)
         if not isinstance(seg_id, str) or not seg_id:
             raise SkillError(f"Segment at index {index} has invalid id.")
         if seg_id in seen_ids:
@@ -182,6 +221,8 @@ def load_segments(path: Path) -> list[Segment]:
             isinstance(token, str) for token in protected_tokens
         ):
             raise SkillError(f"Segment {seg_id} has invalid protected_tokens.")
+        if not isinstance(segment_type, str) or segment_type not in SEGMENT_TYPES:
+            raise SkillError(f"Segment {seg_id} has invalid segment_type.")
         seen_ids.add(seg_id)
         segments.append(
             Segment(
@@ -190,26 +231,35 @@ def load_segments(path: Path) -> list[Segment]:
                 source=source,
                 source_hash=source_hash,
                 protected_tokens=protected_tokens,
+                segment_type=segment_type,
             )
         )
     return segments
 
 
-def load_translation_map(path: Path, segments: list[Segment], job_id: str) -> dict[str, str]:
+def validate_translations(
+    path: Path, segments: list[Segment], job_id: str
+) -> tuple[dict[str, str], list[str], list[str]]:
     data = read_json(path)
+    errors: list[str] = []
+    warnings: list[str] = []
     if data.get("schema_version") != SCHEMA_VERSION:
-        raise SkillError(f"Unsupported translations schema in {path}.")
+        errors.append(f"unsupported translations schema in {path}")
     if data.get("job_id") != job_id:
-        raise SkillError(
-            f"translations.json job_id {data.get('job_id')!r} does not match {job_id!r}."
+        errors.append(
+            f"translations.json job_id {data.get('job_id')!r} does not match {job_id!r}"
         )
     raw_segments = data.get("segments")
     if not isinstance(raw_segments, list):
-        raise SkillError("translations.json must contain a segments array.")
+        errors.append("translations.json must contain a segments array")
+        return {}, errors, warnings
+    if len(raw_segments) != len(segments):
+        errors.append(
+            f"segment count mismatch: expected {len(segments)}, got {len(raw_segments)}"
+        )
 
     expected = {segment.id: segment for segment in segments}
     translations: dict[str, str] = {}
-    errors: list[str] = []
     for index, raw in enumerate(raw_segments):
         if not isinstance(raw, dict):
             errors.append(f"translation at index {index} must be an object")
@@ -219,6 +269,12 @@ def load_translation_map(path: Path, segments: list[Segment], job_id: str) -> di
         translation = raw.get("translation")
         if not isinstance(seg_id, str) or seg_id not in expected:
             errors.append(f"unknown segment id at index {index}: {seg_id!r}")
+            continue
+        expected_id = segments[index].id if index < len(segments) else None
+        if expected_id is not None and seg_id != expected_id:
+            errors.append(
+                f"segment order mismatch at index {index}: expected {expected_id}, got {seg_id}"
+            )
             continue
         if seg_id in translations:
             errors.append(f"duplicate translation id: {seg_id}")
@@ -238,11 +294,22 @@ def load_translation_map(path: Path, segments: list[Segment], job_id: str) -> di
                 f"{seg_id}: translation is missing protected tokens {missing_tokens}"
             )
             continue
+        if (
+            segment.segment_type == SEGMENT_REFERENCE_ENTRY
+            and translation != segment.source
+        ):
+            errors.append(f"{seg_id}: reference_entry translation must equal source")
+            continue
         translations[seg_id] = translation
 
     missing_ids = [segment.id for segment in segments if segment.id not in translations]
     if missing_ids:
         errors.append(f"missing translations for: {', '.join(missing_ids[:20])}")
+    return translations, errors, warnings
+
+
+def load_translation_map(path: Path, segments: list[Segment], job_id: str) -> dict[str, str]:
+    translations, errors, _warnings = validate_translations(path, segments, job_id)
     if errors:
         raise SkillError("Invalid translations.json:\n- " + "\n- ".join(errors))
     return translations
@@ -386,8 +453,151 @@ def run_pdf2zh(
         raise SkillError(f"pdf2zh translation pipeline failed: {exc}") from exc
 
 
+def run_pdf2zh_with_warnings(
+    input_pdf: Path,
+    output_dir: Path,
+    source_language: str,
+    target_language: str,
+    service: str,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    stderr = StringIO()
+    with contextlib.redirect_stderr(stderr):
+        result_files = run_pdf2zh(
+            input_pdf, output_dir, source_language, target_language, service
+        )
+    warnings = collect_warnings(stderr.getvalue())
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return result_files, warnings
+
+
+def collect_warnings(stderr_text: str) -> list[str]:
+    warnings: list[str] = []
+    if "KeyError: 'post'" in stderr_text or 'KeyError: "post"' in stderr_text:
+        warnings.append(
+            "Font subsetting warning KeyError: 'post' occurred in the PDF pipeline. "
+            "If the command succeeded and validation passes, treat it as non-blocking."
+        )
+    return warnings
+
+
 def make_default_workdir(input_pdf: Path) -> Path:
     return input_pdf.with_name(f"{input_pdf.stem}.translate-work")
+
+
+def reference_ranges(segments: list[Segment]) -> list[str]:
+    ranges: list[str] = []
+    start: Segment | None = None
+    previous: Segment | None = None
+    for segment in segments:
+        if segment.segment_type == SEGMENT_REFERENCE_ENTRY:
+            if start is None:
+                start = segment
+            previous = segment
+        elif start is not None and previous is not None:
+            ranges.append(f"{start.id} through {previous.id}")
+            start = None
+            previous = None
+    if start is not None and previous is not None:
+        ranges.append(f"{start.id} through {previous.id}")
+    return ranges
+
+
+def write_text_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def make_segments_preview(segments: list[Segment]) -> str:
+    lines = [
+        "# Segments Preview",
+        "",
+        "Read this UTF-8 markdown file when terminal output makes Unicode ligatures such as `fi`/`fl` look corrupted.",
+        "",
+    ]
+    for segment in segments:
+        lines.extend(
+            [
+                f"## {segment.id}",
+                "",
+                f"- Type: `{segment.segment_type}`",
+                f"- Protected tokens: {', '.join(f'`{token}`' for token in segment.protected_tokens) if segment.protected_tokens else '(none)'}",
+                "",
+                "Source:",
+                "",
+                "```text",
+                segment.source,
+                "```",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def translation_issues(segment: Segment, translation: str | None) -> list[str]:
+    issues: list[str] = []
+    if translation is None:
+        issues.append("missing translation")
+        return issues
+    if not translation.strip():
+        issues.append("empty translation")
+    missing_tokens = [
+        token for token in segment.protected_tokens if token not in translation
+    ]
+    if missing_tokens:
+        issues.append("missing protected tokens: " + ", ".join(missing_tokens))
+    if segment.segment_type == SEGMENT_REFERENCE_ENTRY and translation != segment.source:
+        issues.append("reference entry translation differs from source")
+    return issues
+
+
+def make_translation_preview(
+    segments: list[Segment], translations: dict[str, str]
+) -> str:
+    lines = [
+        "# Translation Preview",
+        "",
+        "Review this file before delivery. Issues listed here should be fixed before render/verify are trusted.",
+        "",
+    ]
+    for segment in segments:
+        translation = translations.get(segment.id)
+        issues = translation_issues(segment, translation)
+        lines.extend(
+            [
+                f"## {segment.id}",
+                "",
+                f"- Type: `{segment.segment_type}`",
+                f"- Protected tokens: {', '.join(f'`{token}`' for token in segment.protected_tokens) if segment.protected_tokens else '(none)'}",
+                f"- Issues: {', '.join(issues) if issues else '(none)'}",
+                "",
+                "Source:",
+                "",
+                "```text",
+                segment.source,
+                "```",
+                "",
+                "Translation:",
+                "",
+                "```text",
+                translation or "",
+                "```",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def output_file_info(path: Path) -> dict[str, Any]:
+    exists = path.exists()
+    size = path.stat().st_size if exists else 0
+    page_count = pdf_page_count(path) if exists and size else None
+    return {
+        "path": str(path.resolve()),
+        "exists": exists,
+        "bytes": size,
+        "page_count": page_count,
+    }
 
 
 def make_agent_prompt(
@@ -395,7 +605,16 @@ def make_agent_prompt(
     source_language: str,
     target_language: str,
     segment_count: int,
+    reference_entry_ranges: list[str] | None = None,
 ) -> str:
+    ranges = reference_entry_ranges or []
+    reference_note = (
+        "Reference entries detected: "
+        + "; ".join(ranges)
+        + ". Copy each source to translation unchanged."
+        if ranges
+        else "No reference-entry range was detected automatically."
+    )
     return f"""# Agent Translation Task
 
 Translate `segments.json` into `translations.json` for job `{job_id}`.
@@ -404,8 +623,10 @@ Rules:
 - Translate from `{source_language}` to `{target_language}` in faithful academic style.
 - Output JSON only. Do not include markdown fences or commentary.
 - Preserve every `protected_tokens` value exactly in the corresponding translation.
+- Do not translate protected numbering. Keep `Eq. 6`, `Figure 1`, and `Table 2` exactly; do not change them to translated forms such as `公式 6`, `图 1`, or `表 2`.
 - Preserve formula placeholders such as `{{{{v0}}}}`, `{{v0}}`, `<b0>`, `</b0>`, and citation/figure/table numbering.
 - Keep English bibliography/reference entries unchanged. If a segment is a bibliography or reference-list entry, copy its `source` text directly into `translation`.
+- {reference_note}
 - Keep English author names, initials, and Latin-script personal names unchanged. Do not transliterate, localize, or translate author names.
 - Keep DOI, URL, journal names, conference names, publisher names, page ranges, volume/issue identifiers, and publication metadata unchanged.
 - Keep the same segment ids and copy each `source` field exactly.
@@ -438,7 +659,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     captured: list[Segment] = []
     patch_pdf2zh_translators(make_capture_translator(captured))
 
-    result_files = run_pdf2zh(
+    result_files, warnings = run_pdf2zh_with_warnings(
         input_pdf,
         output_dir,
         args.source,
@@ -450,6 +671,7 @@ def command_prepare(args: argparse.Namespace) -> int:
             "pdf2zh did not expose any translatable segments. "
             "Check that the PDF contains selectable text and is not image-only."
         )
+    captured = mark_segment_types(captured)
 
     job_id = uuid.uuid4().hex
     job = {
@@ -475,11 +697,17 @@ def command_prepare(args: argparse.Namespace) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     write_json(workdir / "job.json", job)
     write_json(workdir / "segments.json", segments_json)
-    (workdir / "agent_prompt.md").write_text(
-        make_agent_prompt(job_id, args.source, args.target, len(captured)),
-        encoding="utf-8",
-        newline="\n",
+    write_text_file(
+        workdir / "agent_prompt.md",
+        make_agent_prompt(
+            job_id,
+            args.source,
+            args.target,
+            len(captured),
+            reference_ranges(captured),
+        ),
     )
+    write_text_file(workdir / "segments-preview.md", make_segments_preview(captured))
     write_json(
         workdir / "prepare-report.json",
         {
@@ -487,11 +715,74 @@ def command_prepare(args: argparse.Namespace) -> int:
             "job_id": job_id,
             "captured_segments": len(captured),
             "capture_output_files": result_files,
+            "warnings": warnings,
             "next_step": "Use the current agent model to translate segments.json into translations.json, then run render.",
         },
     )
     print(f"Prepared {len(captured)} segments in {workdir}")
     print(f"Next: create {workdir / 'translations.json'} from segments.json.")
+    print(f"Then validate with: {Path(__file__).name} validate {workdir}")
+    return 0
+
+
+def validation_report_data(
+    job: dict[str, Any],
+    segments: list[Segment],
+    translations_path: Path,
+    errors: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    type_counts = {segment_type: 0 for segment_type in sorted(SEGMENT_TYPES)}
+    for segment in segments:
+        type_counts[segment.segment_type] += 1
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": job.get("job_id"),
+        "ok": not errors,
+        "translations_path": str(translations_path.resolve()),
+        "segment_count": len(segments),
+        "segment_type_counts": type_counts,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def write_validation_report(
+    workdir: Path,
+    job: dict[str, Any],
+    segments: list[Segment],
+    translations_path: Path,
+    errors: list[str],
+    warnings: list[str],
+) -> None:
+    write_json(
+        workdir / "validate-report.json",
+        validation_report_data(job, segments, translations_path, errors, warnings),
+    )
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir).resolve()
+    job = read_json(workdir / "job.json")
+    segments = load_segments(workdir / "segments.json")
+    translations_path = (
+        Path(args.translations).resolve()
+        if args.translations
+        else workdir / "translations.json"
+    )
+    translations, errors, warnings = validate_translations(
+        translations_path, segments, str(job.get("job_id"))
+    )
+    write_validation_report(workdir, job, segments, translations_path, errors, warnings)
+    if translations:
+        write_text_file(
+            workdir / "translation-preview.md",
+            make_translation_preview(segments, translations),
+        )
+    if errors:
+        raise SkillError("Validation failed:\n- " + "\n- ".join(errors))
+    print(f"Validation passed. Report: {workdir / 'validate-report.json'}")
+    print(f"Preview: {workdir / 'translation-preview.md'}")
     return 0
 
 
@@ -510,14 +801,24 @@ def command_render(args: argparse.Namespace) -> int:
         if args.translations
         else workdir / "translations.json"
     )
-    translations = load_translation_map(
+    translations, validation_errors, validation_warnings = validate_translations(
         translations_path, segments, str(job.get("job_id"))
     )
+    if validation_errors:
+        write_validation_report(
+            workdir,
+            job,
+            segments,
+            translations_path,
+            validation_errors,
+            validation_warnings,
+        )
+        raise SkillError("Invalid translations.json:\n- " + "\n- ".join(validation_errors))
 
     output_dir = workdir / "output"
     replayed: list[str] = []
     patch_pdf2zh_translators(make_replay_translator(segments, translations, replayed))
-    result_files = run_pdf2zh(
+    result_files, render_warnings = run_pdf2zh_with_warnings(
         input_pdf,
         output_dir,
         str(job.get("source_language", DEFAULT_SOURCE_LANGUAGE)),
@@ -528,6 +829,10 @@ def command_render(args: argparse.Namespace) -> int:
         raise SkillError(
             f"pdf2zh replayed {len(replayed)} segments, expected {len(segments)}."
         )
+    write_text_file(
+        workdir / "translation-preview.md",
+        make_translation_preview(segments, translations),
+    )
     write_json(
         workdir / "render-report.json",
         {
@@ -535,6 +840,14 @@ def command_render(args: argparse.Namespace) -> int:
             "job_id": job.get("job_id"),
             "rendered_segments": len(replayed),
             "output_files": result_files,
+            "outputs": {
+                label: output_file_info(path)
+                for label, path in {
+                    "mono_pdf": output_dir / f"{input_pdf.stem}-mono.pdf",
+                    "dual_pdf": output_dir / f"{input_pdf.stem}-dual.pdf",
+                }.items()
+            },
+            "warnings": validation_warnings + render_warnings,
         },
     )
     print(f"Rendered translated PDFs in {output_dir}")
@@ -558,8 +871,16 @@ def command_verify(args: argparse.Namespace) -> int:
     segments = load_segments(workdir / "segments.json")
     translations_path = workdir / "translations.json"
     translations_valid = translations_path.exists()
+    warnings: list[str] = []
     if translations_valid:
-        load_translation_map(translations_path, segments, str(job.get("job_id")))
+        _translations, validation_errors, validation_warnings = validate_translations(
+            translations_path, segments, str(job.get("job_id"))
+        )
+        warnings.extend(validation_warnings)
+        if validation_errors:
+            raise SkillError(
+                "Invalid translations.json:\n- " + "\n- ".join(validation_errors)
+            )
 
     stem = Path(str(job.get("input_pdf", "paper.pdf"))).stem
     mono_pdf = workdir / "output" / f"{stem}-mono.pdf"
@@ -567,19 +888,24 @@ def command_verify(args: argparse.Namespace) -> int:
     outputs: dict[str, Any] = {}
     errors: list[str] = []
     for label, path in {"mono_pdf": mono_pdf, "dual_pdf": dual_pdf}.items():
-        exists = path.exists()
-        size = path.stat().st_size if exists else 0
-        page_count = pdf_page_count(path) if exists and size else None
-        outputs[label] = {
-            "path": str(path),
-            "exists": exists,
-            "bytes": size,
-            "page_count": page_count,
-        }
+        info = output_file_info(path)
+        outputs[label] = info
+        exists = bool(info["exists"])
+        size = int(info["bytes"])
         if not exists:
             errors.append(f"Missing output: {path}")
         elif size == 0:
             errors.append(f"Output is empty: {path}")
+
+    for report_name in ("prepare-report.json", "render-report.json"):
+        report_path = workdir / report_name
+        if report_path.exists():
+            report = read_json(report_path)
+            report_warnings = report.get("warnings", [])
+            if isinstance(report_warnings, list):
+                warnings.extend(
+                    warning for warning in report_warnings if isinstance(warning, str)
+                )
 
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -588,6 +914,7 @@ def command_verify(args: argparse.Namespace) -> int:
         "segment_count": len(segments),
         "translations_json_present": translations_valid,
         "outputs": outputs,
+        "warnings": warnings,
         "errors": errors,
     }
     write_json(workdir / "report.json", report)
@@ -643,6 +970,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to translations.json. Default: <workdir>/translations.json",
     )
     render.set_defaults(func=command_render)
+
+    validate = subparsers.add_parser(
+        "validate", help="Validate translations.json before rendering."
+    )
+    validate.add_argument("workdir", help="Work directory created by prepare.")
+    validate.add_argument(
+        "--translations",
+        help="Path to translations.json. Default: <workdir>/translations.json",
+    )
+    validate.set_defaults(func=command_validate)
 
     verify = subparsers.add_parser(
         "verify", help="Validate translated outputs and write report.json."
